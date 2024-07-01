@@ -1,47 +1,44 @@
 """
-title: Anthropic Manifold Pipeline
+title: Cohere Manifold Pipeline
 author: justinh-rahb
-date: 2024-05-27
+date: 2024-05-28
 version: 1.0
 license: MIT
 description: A pipeline for generating text using the Anthropic API.
-requirements: requests, anthropic
-environment_variables: ANTHROPIC_API_KEY
+requirements: requests
+environment_variables: COHERE_API_KEY
 """
 
 import os
-from anthropic import Anthropic, RateLimitError, APIStatusError, APIConnectionError
-
+import json
 from schemas import OpenAIChatMessage
 from typing import List, Union, Generator, Iterator
 from pydantic import BaseModel
 import requests
 
-from utils.pipelines.main import pop_system_message
-
 
 class Pipeline:
     class Valves(BaseModel):
-        ANTHROPIC_API_KEY: str = ""
+        COHERE_API_BASE_URL: str = "https://api.cohere.com/v1"
+        COHERE_API_KEY: str = ""
 
     def __init__(self):
         self.type = "manifold"
-        self.id = "anthropic"
-        self.name = "anthropic/"
+
+        # Optionally, you can set the id and name of the pipeline.
+        # Best practice is to not specify the id so that it can be automatically inferred from the filename, so that users can install multiple versions of the same pipeline.
+        # The identifier must be unique across all pipelines.
+        # The identifier must be an alphanumeric string that can include underscores or hyphens. It cannot contain spaces, special characters, slashes, or backslashes.
+
+        self.id = "cohere"
+
+        self.name = "cohere/"
 
         self.valves = self.Valves(
-            **{"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", "your-api-key-here")}
+            **{"COHERE_API_KEY": os.getenv("COHERE_API_KEY", "your-api-key-here")}
         )
-        self.client = Anthropic(api_key=self.valves.ANTHROPIC_API_KEY)
 
-    def get_anthropic_models(self):
-        # In the future, this could fetch models dynamically from Anthropic
-        return [
-            {"id": "claude-3-haiku-20240307", "name": "claude-3-haiku"},
-            {"id": "claude-3-opus-20240229", "name": "claude-3-opus"},
-            {"id": "claude-3-sonnet-20240229", "name": "claude-3-sonnet"},
-            {"id": "claude-3-5-sonnet-20240620", "name": "claude-3-5-sonnet"},
-        ]
+        self.pipelines = self.get_cohere_models()
 
     async def on_startup(self):
         print(f"on_startup:{__name__}")
@@ -53,94 +50,114 @@ class Pipeline:
 
     async def on_valves_updated(self):
         # This function is called when the valves are updated.
-        self.client = Anthropic(api_key=self.valves.ANTHROPIC_API_KEY)
+
+        self.pipelines = self.get_cohere_models()
+
         pass
 
-    # Pipelines are the models that are available in the manifold.
-    # It can be a list or a function that returns a list.
-    def pipelines(self) -> List[dict]:
-        return self.get_anthropic_models()
+    def get_cohere_models(self):
+        if self.valves.COHERE_API_KEY:
+            try:
+                headers = {}
+                headers["Authorization"] = f"Bearer {self.valves.COHERE_API_KEY}"
+                headers["Content-Type"] = "application/json"
+
+                r = requests.get(
+                    f"{self.valves.COHERE_API_BASE_URL}/models", headers=headers
+                )
+
+                models = r.json()
+                return [
+                    {
+                        "id": model["name"],
+                        "name": model["name"] if "name" in model else model["name"],
+                    }
+                    for model in models["models"]
+                ]
+            except Exception as e:
+
+                print(f"Error: {e}")
+                return [
+                    {
+                        "id": self.id,
+                        "name": "Could not fetch models from Cohere, please update the API Key in the valves.",
+                    },
+                ]
+        else:
+            return []
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
         try:
-            if "user" in body:
-                del body["user"]
-            if "chat_id" in body:
-                del body["chat_id"]
-            if "title" in body:
-                del body["title"]
-
             if body.get("stream", False):
-                return self.stream_response(model_id, messages, body)
+                return self.stream_response(user_message, model_id, messages, body)
             else:
-                return self.get_completion(model_id, messages, body)
-        except (RateLimitError, APIStatusError, APIConnectionError) as e:
+                return self.get_completion(user_message, model_id, messages, body)
+        except Exception as e:
             return f"Error: {e}"
 
     def stream_response(
-        self, model_id: str, messages: List[dict], body: dict
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Generator:
-        system_message, messages = pop_system_message(messages)
 
-        max_tokens = (
-            body.get("max_tokens") if body.get("max_tokens") is not None else 4096
-        )
-        temperature = (
-            body.get("temperature") if body.get("temperature") is not None else 0.8
-        )
-        top_k = body.get("top_k") if body.get("top_k") is not None else 40
-        top_p = body.get("top_p") if body.get("top_p") is not None else 0.9
-        stop_sequences = body.get("stop") if body.get("stop") is not None else []
+        headers = {}
+        headers["Authorization"] = f"Bearer {self.valves.COHERE_API_KEY}"
+        headers["Content-Type"] = "application/json"
 
-        stream = self.client.messages.create(
-            **{
+        r = requests.post(
+            url=f"{self.valves.COHERE_API_BASE_URL}/chat",
+            json={
                 "model": model_id,
-                **(
-                    {"system": system_message} if system_message else {}
-                ),  # Add system message if it exists (optional
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "stop_sequences": stop_sequences,
+                "chat_history": [
+                    {
+                        "role": "USER" if message["role"] == "user" else "CHATBOT",
+                        "message": message["content"],
+                    }
+                    for message in messages[:-1]
+                ],
+                "message": user_message,
                 "stream": True,
-            }
+            },
+            headers=headers,
+            stream=True,
         )
 
-        for chunk in stream:
-            if chunk.type == "content_block_start":
-                yield chunk.content_block.text
-            elif chunk.type == "content_block_delta":
-                yield chunk.delta.text
+        r.raise_for_status()
 
-    def get_completion(self, model_id: str, messages: List[dict], body: dict) -> str:
-        system_message, messages = pop_system_message(messages)
+        for line in r.iter_lines():
+            if line:
+                try:
+                    line = json.loads(line)
+                    if line["event_type"] == "text-generation":
+                        yield line["text"]
+                except:
+                    pass
 
-        max_tokens = (
-            body.get("max_tokens") if body.get("max_tokens") is not None else 4096
-        )
-        temperature = (
-            body.get("temperature") if body.get("temperature") is not None else 0.8
-        )
-        top_k = body.get("top_k") if body.get("top_k") is not None else 40
-        top_p = body.get("top_p") if body.get("top_p") is not None else 0.9
-        stop_sequences = body.get("stop") if body.get("stop") is not None else []
+    def get_completion(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> str:
+        headers = {}
+        headers["Authorization"] = f"Bearer {self.valves.COHERE_API_KEY}"
+        headers["Content-Type"] = "application/json"
 
-        response = self.client.messages.create(
-            **{
+        r = requests.post(
+            url=f"{self.valves.COHERE_API_BASE_URL}/chat",
+            json={
                 "model": model_id,
-                **(
-                    {"system": system_message} if system_message else {}
-                ),  # Add system message if it exists (optional
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_k": top_k,
-                "top_p": top_p,
-                "stop_sequences": stop_sequences,
-            }
+                "chat_history": [
+                    {
+                        "role": "USER" if message["role"] == "user" else "CHATBOT",
+                        "message": message["content"],
+                    }
+                    for message in messages[:-1]
+                ],
+                "message": user_message,
+            },
+            headers=headers,
         )
-        return response.content[0].text
+
+        r.raise_for_status()
+        data = r.json()
+
+        return data["text"] if "text" in data else "No response from Cohere."
