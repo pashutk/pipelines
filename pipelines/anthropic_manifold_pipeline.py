@@ -1,44 +1,46 @@
 """
-title: Cohere Manifold Pipeline
+title: Anthropic Manifold Pipeline
 author: justinh-rahb
-date: 2024-05-28
-version: 1.0
+date: 2024-06-20
+version: 1.3
 license: MIT
-description: A pipeline for generating text using the Anthropic API.
-requirements: requests
-environment_variables: COHERE_API_KEY
+description: A pipeline for generating text and processing images using the Anthropic API.
+requirements: requests, anthropic
+environment_variables: ANTHROPIC_API_KEY
 """
 
 import os
-import json
+from anthropic import Anthropic, RateLimitError, APIStatusError, APIConnectionError
+
 from schemas import OpenAIChatMessage
 from typing import List, Union, Generator, Iterator
 from pydantic import BaseModel
 import requests
 
+from utils.pipelines.main import pop_system_message
+
 
 class Pipeline:
     class Valves(BaseModel):
-        COHERE_API_BASE_URL: str = "https://api.cohere.com/v1"
-        COHERE_API_KEY: str = ""
+        ANTHROPIC_API_KEY: str = ""
 
     def __init__(self):
         self.type = "manifold"
-
-        # Optionally, you can set the id and name of the pipeline.
-        # Best practice is to not specify the id so that it can be automatically inferred from the filename, so that users can install multiple versions of the same pipeline.
-        # The identifier must be unique across all pipelines.
-        # The identifier must be an alphanumeric string that can include underscores or hyphens. It cannot contain spaces, special characters, slashes, or backslashes.
-
-        self.id = "cohere"
-
-        self.name = "cohere/"
+        self.id = "anthropic"
+        self.name = "anthropic/"
 
         self.valves = self.Valves(
-            **{"COHERE_API_KEY": os.getenv("COHERE_API_KEY", "your-api-key-here")}
+            **{"ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY", "your-api-key-here")}
         )
+        self.client = Anthropic(api_key=self.valves.ANTHROPIC_API_KEY)
 
-        self.pipelines = self.get_cohere_models()
+    def get_anthropic_models(self):
+        return [
+            {"id": "claude-3-haiku-20240307", "name": "claude-3-haiku"},
+            {"id": "claude-3-opus-20240229", "name": "claude-3-opus"},
+            {"id": "claude-3-sonnet-20240229", "name": "claude-3-sonnet"},
+            {"id": "claude-3-5-sonnet-20240620", "name": "claude-3.5-sonnet"},
+        ]
 
     async def on_startup(self):
         print(f"on_startup:{__name__}")
@@ -49,115 +51,101 @@ class Pipeline:
         pass
 
     async def on_valves_updated(self):
-        # This function is called when the valves are updated.
-
-        self.pipelines = self.get_cohere_models()
-
+        self.client = Anthropic(api_key=self.valves.ANTHROPIC_API_KEY)
         pass
 
-    def get_cohere_models(self):
-        if self.valves.COHERE_API_KEY:
-            try:
-                headers = {}
-                headers["Authorization"] = f"Bearer {self.valves.COHERE_API_KEY}"
-                headers["Content-Type"] = "application/json"
+    def pipelines(self) -> List[dict]:
+        return self.get_anthropic_models()
 
-                r = requests.get(
-                    f"{self.valves.COHERE_API_BASE_URL}/models", headers=headers
-                )
-
-                models = r.json()
-                return [
-                    {
-                        "id": model["name"],
-                        "name": model["name"] if "name" in model else model["name"],
-                    }
-                    for model in models["models"]
-                ]
-            except Exception as e:
-
-                print(f"Error: {e}")
-                return [
-                    {
-                        "id": self.id,
-                        "name": "Could not fetch models from Cohere, please update the API Key in the valves.",
-                    },
-                ]
+    def process_image(self, image_data):
+        if image_data["url"].startswith("data:image"):
+            mime_type, base64_data = image_data["url"].split(",", 1)
+            media_type = mime_type.split(":")[1].split(";")[0]
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": base64_data,
+                },
+            }
         else:
-            return []
+            return {
+                "type": "image",
+                "source": {"type": "url", "url": image_data["url"]},
+            }
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
         try:
+            # Remove unnecessary keys
+            for key in ['user', 'chat_id', 'title']:
+                body.pop(key, None)
+
+            system_message, messages = pop_system_message(messages)
+
+            processed_messages = []
+            image_count = 0
+            total_image_size = 0
+
+            for message in messages:
+                processed_content = []
+                if isinstance(message.get("content"), list):
+                    for item in message["content"]:
+                        if item["type"] == "text":
+                            processed_content.append({"type": "text", "text": item["text"]})
+                        elif item["type"] == "image_url":
+                            if image_count >= 5:
+                                raise ValueError("Maximum of 5 images per API call exceeded")
+
+                            processed_image = self.process_image(item["image_url"])
+                            processed_content.append(processed_image)
+
+                            if processed_image["source"]["type"] == "base64":
+                                image_size = len(processed_image["source"]["data"]) * 3 / 4
+                            else:
+                                image_size = 0
+
+                            total_image_size += image_size
+                            if total_image_size > 100 * 1024 * 1024:
+                                raise ValueError("Total size of images exceeds 100 MB limit")
+
+                            image_count += 1
+                else:
+                    processed_content = [{"type": "text", "text": message.get("content", "")}]
+
+                processed_messages.append({"role": message["role"], "content": processed_content})
+
+            # Prepare the payload
+            payload = {
+                "model": model_id,
+                "messages": processed_messages,
+                "max_tokens": body.get("max_tokens", 4096),
+                "temperature": body.get("temperature", 0.8),
+                "top_k": body.get("top_k", 40),
+                "top_p": body.get("top_p", 0.9),
+                "stop_sequences": body.get("stop", []),
+                **({"system": str(system_message)} if system_message else {}),
+                "stream": body.get("stream", False),
+            }
+
             if body.get("stream", False):
-                return self.stream_response(user_message, model_id, messages, body)
+                return self.stream_response(model_id, payload)
             else:
-                return self.get_completion(user_message, model_id, messages, body)
-        except Exception as e:
+                return self.get_completion(model_id, payload)
+        except (RateLimitError, APIStatusError, APIConnectionError) as e:
             return f"Error: {e}"
 
-    def stream_response(
-        self, user_message: str, model_id: str, messages: List[dict], body: dict
-    ) -> Generator:
+    def stream_response(self, model_id: str, payload: dict) -> Generator:
+        stream = self.client.messages.create(**payload)
 
-        headers = {}
-        headers["Authorization"] = f"Bearer {self.valves.COHERE_API_KEY}"
-        headers["Content-Type"] = "application/json"
+        for chunk in stream:
+            if chunk.type == "content_block_start":
+                yield chunk.content_block.text
+            elif chunk.type == "content_block_delta":
+                yield chunk.delta.text
 
-        r = requests.post(
-            url=f"{self.valves.COHERE_API_BASE_URL}/chat",
-            json={
-                "model": model_id,
-                "chat_history": [
-                    {
-                        "role": "USER" if message["role"] == "user" else "CHATBOT",
-                        "message": message["content"],
-                    }
-                    for message in messages[:-1]
-                ],
-                "message": user_message,
-                "stream": True,
-            },
-            headers=headers,
-            stream=True,
-        )
-
-        r.raise_for_status()
-
-        for line in r.iter_lines():
-            if line:
-                try:
-                    line = json.loads(line)
-                    if line["event_type"] == "text-generation":
-                        yield line["text"]
-                except:
-                    pass
-
-    def get_completion(
-        self, user_message: str, model_id: str, messages: List[dict], body: dict
-    ) -> str:
-        headers = {}
-        headers["Authorization"] = f"Bearer {self.valves.COHERE_API_KEY}"
-        headers["Content-Type"] = "application/json"
-
-        r = requests.post(
-            url=f"{self.valves.COHERE_API_BASE_URL}/chat",
-            json={
-                "model": model_id,
-                "chat_history": [
-                    {
-                        "role": "USER" if message["role"] == "user" else "CHATBOT",
-                        "message": message["content"],
-                    }
-                    for message in messages[:-1]
-                ],
-                "message": user_message,
-            },
-            headers=headers,
-        )
-
-        r.raise_for_status()
-        data = r.json()
-
-        return data["text"] if "text" in data else "No response from Cohere."
+    def get_completion(self, model_id: str, payload: dict) -> str:
+        response = self.client.messages.create(**payload)
+        return response.content[0].text
